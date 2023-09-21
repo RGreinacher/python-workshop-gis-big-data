@@ -1,0 +1,10 @@
+h5netcdf
+joblib
+numpy
+pandas
+pip
+scipy
+tqdm
+wheel
+xarray
+jupytext
