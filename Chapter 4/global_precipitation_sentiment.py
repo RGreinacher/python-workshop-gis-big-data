@@ -6,7 +6,8 @@ Workshop: Python for Geospatial Big Data and Data Science Using the FASRC, Sept 
 Robert P. Spang, TU Berlin, Germany & CGA, Harvard University, USA (spang@tu-berlin.de)
 
 This script analyses sentiment change in tweets based on precipitation data.
-Usage: python global_precipitation_sentiment.py -s PATH/TO/DATASET -r PATH/TO/RESULTS -y 2022 -p 4
+Usage: python global_precipitation_sentiment.py
+If you use the argparse version, you can use it like: python global_precipitation_sentiment.py -s PATH/TO/DATASET -r PATH/TO/RESULTS -y 2022 -p 4
 """
 
 
@@ -19,30 +20,30 @@ from tqdm import tqdm
 import xarray as xr
 from glob import glob
 from joblib import Parallel, delayed
-import argparse
+# import argparse # optional, for CLI arguments
 
 
 
-DATASET_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/FASRC'
-RESULTS_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/results'
+DATASET_ROOT = 'PATH/TO/DATASET'
+RESULTS_ROOT = 'PATH/TO/RESULTS'
 YEAR = 2022
 NUM_PROCESSES = 4
 
 
 
-# configure CLI arguments
-if __name__ == '__main__':
-    argParser = argparse.ArgumentParser()
-    argParser.add_argument("-s", "--source", help="path to dataset source folder", type=str, default=DATASET_ROOT)
-    argParser.add_argument("-r", "--results", help="path to results destination folder", type=str, default=RESULTS_ROOT)
-    argParser.add_argument("-y", "--year", help="year to analyze", type=int, default=YEAR, choices=range(2012, 2024))
-    argParser.add_argument("-p", "--processes", help="number of processes to use", type=int, default=NUM_PROCESSES, choices=range(1, 64))
-    args = argParser.parse_args()
+# # configure CLI arguments
+# if __name__ == '__main__':
+#     argParser = argparse.ArgumentParser()
+#     argParser.add_argument("-s", "--source", help="path to dataset source folder", type=str, default=DATASET_ROOT)
+#     argParser.add_argument("-r", "--results", help="path to results destination folder", type=str, default=RESULTS_ROOT)
+#     argParser.add_argument("-y", "--year", help="year to analyze", type=int, default=YEAR, choices=range(2012, 2024))
+#     argParser.add_argument("-p", "--processes", help="number of processes to use", type=int, default=NUM_PROCESSES, choices=range(1, 64))
+#     args = argParser.parse_args()
 
-    DATASET_ROOT = args.source
-    RESULTS_ROOT = args.results
-    YEAR = args.year
-    NUM_PROCESSES = args.processes
+#     DATASET_ROOT = args.source
+#     RESULTS_ROOT = args.results
+#     YEAR = args.year
+#     NUM_PROCESSES = args.processes
 
 
 
@@ -51,27 +52,25 @@ if __name__ == '__main__':
 ###############################################################################
 # read and pre process tweets table
 tweets_df = pd.read_csv(f'{DATASET_ROOT}/twitter_sentiment_geo_index/num_posts_and_sentiment_summary_{YEAR}.csv')
-tweets_df.columns = ['date', 'country', 'state', 'county', 'sentiment_score', 'tweets']
-tweets_df['state'] = tweets_df.state.apply(lambda x: x.split('_')[-1])
-tweets_df['county'] = tweets_df.county.apply(lambda x: x.split('_')[-1])
+tweets_df.columns = ['date', 'country', 'state', 'county', 'sentiment_score', 'tweets'] # rename columns
+tweets_df['state'] = tweets_df.state.apply(lambda x: x.split('_')[-1]) # filter state names
+tweets_df['county'] = tweets_df.county.apply(lambda x: x.split('_')[-1]) # filter county names
 
-# read and pre process county coordinates table
+# define a toy example with one country only
+tweets_subset = tweets_df[tweets_df.country.isin(['United States'])]
+
+# read the county coordinates table
 county_coordinates = pd.read_csv(f'{DATASET_ROOT}/county_coordinates/lookup.csv')
 
 # add coordinates
-tweets_with_coords = tweets_df.merge(county_coordinates, on=['country', 'state', 'county'], how='left')
-tweets_with_coords = tweets_with_coords.dropna(subset=['lat', 'lon'])
-
-# full_df = tweets_with_coords.copy()
-state_subset = ['Massachusetts', 'Connecticut', 'Rhode Island', 'New Hampshire', 'Vermont', 'Maine']
-full_df = tweets_with_coords[tweets_with_coords.state.isin(state_subset)].copy() # test with a few close states only
+full_df = tweets_subset.merge(county_coordinates, on=['country', 'state', 'county'], how='left')
+full_df = full_df.dropna(subset=['lat', 'lon'])
 
 # remove days with very few tweets
 full_df = full_df[full_df.tweets >= 10].copy()
 
-full_df.sentiment_score.hist(bins=100)
-np.percentile(full_df.sentiment_score, 90)
-print(f"loaded tweet table successfully ({len(full_df)} samples), avg sentiment score: {full_df.sentiment_score.median()}")
+# print status
+print(f"loaded tweets and county coordinates table successfully ({len(full_df)} samples), avg sentiment score: {full_df.sentiment_score.median()}")
 
 
 
@@ -79,37 +78,64 @@ print(f"loaded tweet table successfully ({len(full_df)} samples), avg sentiment 
 # setup NOAA CPC data
 # data source: https://psl.noaa.gov/data/gridded/data.cpc.globalprecip.html
 ###############################################################################
-def load_dataset_for_year(year):
-    filename = glob(f"{DATASET_ROOT}/precipitation/precip.{year}.nc")[0]
-    return xr.open_dataset(filename)
-    
-def read_precipitation_values(df):
-    # df = full_df.sample(100)
-    dataset = load_dataset_for_year(YEAR)
-    precip_values = dataset.precip.values
+noaa_cpc_dataset = xr.open_dataset(f"{DATASET_ROOT}/precipitation/precip.{YEAR}.nc")
 
-    df['dataset_day_idx'] = df.date.apply(lambda x: datetime.strptime(x, "%Y-%m-%d").timetuple().tm_yday - 1)
-    df['dataset_x'] = df.lon.apply(lambda x: np.abs(dataset.indexes['lon'] - (x + 360 if x < 0 else x)).argmin())
-    df['dataset_y'] = df.lat.apply(lambda y: np.abs(dataset.indexes['lat'] - y).argmin())
+# print status
+print(f"loaded NOAA CPC precipitation data successfully")
 
-    # precip_values = dataset.precip.values
-    values_with_idxs = df.apply(lambda r: precip_values[r.dataset_day_idx, r.dataset_y, r.dataset_x], axis=1)
-    return values_with_idxs
+# cache indexes for faster access
+day_memory = {}
+lon_memory = {}
+lat_memory = {}
+
+def precipitation_for_row(row):
+
+    # compute the array index for the day of the year
+    if row.date in day_memory:
+        day_idx = day_memory[row.date]
+    else:
+        day_idx = datetime.strptime(row.date, "%Y-%m-%d").timetuple().tm_yday - 1
+        day_memory[row.date] = day_idx
+
+    # compute array index for longitude value
+    if row.lon in lon_memory:
+        x = lon_memory[row.lon]
+    else:
+        lon_values = noaa_cpc_dataset.indexes['lon']
+        if row.lon < 0:
+            lon_0_to_360 = row.lon + 360
+        else:
+            lon_0_to_360 = row.lon
+        x = np.abs(lon_values - lon_0_to_360).argmin()
+        lon_memory[row.lon] = x
+
+    # compute array index for latitude value
+    if row.lat in lat_memory:
+        y = lat_memory[row.lat]
+    else:
+        lat_values = noaa_cpc_dataset.indexes['lat']
+        y = np.abs(lat_values - row.lat).argmin()
+        lat_memory[row.lat] = y
+
+    # read the precipitation value using the three computed indexes
+    return noaa_cpc_dataset.precip.values[day_idx, y, x]
+
+def augment_precipitation_values(df):
+    # augment tweets table with the NOAA CPC precipitation data
+    return df.apply(lambda row: precipitation_for_row(row), axis=1)
 
 
 
 ###############################################################################
 # augment tweets table with PRISM precipitation data
 ###############################################################################
-full_df['year'] = full_df.date.str[:4]
+start_ts = datetime.now()
 
 # split the df into separate chunks
 df_chunks = np.array_split(full_df, NUM_PROCESSES)
 
-start = datetime.now()
-
 # create a list of tasks where each task is a delayed execution of the function on a chunk
-delayed_function_calls = [delayed(read_precipitation_values)(chunk) for chunk in df_chunks]
+delayed_function_calls = [delayed(augment_precipitation_values)(chunk) for chunk in df_chunks]
 
 # execute tasks in parallel
 result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed_function_calls)
@@ -118,8 +144,9 @@ result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed_function_calls)
 for result_subset in result_chunks:
     full_df.loc[result_subset.index, 'precipitation'] = result_subset.values
 
-end = datetime.now()
-time_delta = end - start
+# print status
+end_ts = datetime.now()
+time_delta = end_ts - start_ts
 print(f'Augmenting the tweets table with precipitation data took {time_delta} ({NUM_PROCESSES} cores)')
 
 # remove nan values
@@ -131,7 +158,6 @@ full_df = full_df.dropna(subset=['precipitation'])
 # analyze results I - absolute comparison per country
 ###############################################################################
 RELEVANT_PRECIPITATION_THRESHOLD = 12 * 2.5 # >= 12h of at least 2.5mm/h
-# df = full_df[full_df.country == 'Switzerland'].copy()
 
 def compute_statistics(df):
     no_rain_df = df[df.precipitation == 0]
@@ -159,33 +185,23 @@ def compute_statistics(df):
 
     return no_rain_mean, rain_mean, group_diff, no_rain_std, rain_std, cohens_d, no_rain_count, rain_count, statistic, p_val
 
+# group the DF and compute statistics
+grouped_statistics = (
+    full_df
+    .groupby(['country', 'state', 'county'])
+    .apply(compute_statistics)
+)
 
-# create a new dataframe, grouped by country
-rain_no_rain_differences = full_df.groupby('country').sentiment_score.mean()
-rain_no_rain_differences = rain_no_rain_differences.to_frame()
-rain_no_rain_differences.columns = ['mean_sentiment_score']
-
-# add statistical metrics
-grouped_results = full_df.groupby('country').apply(compute_statistics) # TODO: this should be computed per county, and then averaged per country
-nr_mean, r_mean, group_diff, nr_std, r_std, cohens_d, nr_count, r_count, statistic, p_val = zip(*grouped_results)
-
-rain_no_rain_differences['group_diff'] = group_diff
-rain_no_rain_differences['no_rain_mean'] = nr_mean
-rain_no_rain_differences['rain_mean'] = r_mean
-
-rain_no_rain_differences['no_rain_std'] = nr_std
-rain_no_rain_differences['rain_std'] = r_std
-
-rain_no_rain_differences['no_rain_days'] = nr_count
-rain_no_rain_differences['rain_days'] = r_count
-
-rain_no_rain_differences['effect_size_d'] = cohens_d
-rain_no_rain_differences['p_welch'] = p_val
-rain_no_rain_differences['t_welch'] = statistic
+# create a summary DF
+summary_df = pd.DataFrame(grouped_statistics.tolist(), columns=['no_rain_mean', 'rain_mean', 'group_diff', 'no_rain_std', 'rain_std', 'cohens_d', 'no_rain_count', 'rain_count', 'statistic', 'p_val'], index=grouped_statistics.index)
 
 # save results
-rain_no_rain_differences.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv', index=True)
+summary_df.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv', index=True)
 print(f"saved results I successfully to '{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv'")
+
+# # compute the average group difference by state & save results
+# average_group_diff_by_state = summary_df.groupby('country').group_diff.mean()
+# average_group_diff_by_state.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv', index=True)
 
 
 
@@ -197,9 +213,8 @@ print(f"saved results I successfully to '{RESULTS_ROOT}/{YEAR}_rain_no_rain_diff
 ###############################################################################
 RELEVANT_PRECIPITATION_THRESHOLD = 5 * 2.5 # >= 5h of at least 2.5mm/h
 
+# define a function that checks if it rained for three consecutive days
 def check_consecutive_days(group):
-    # group = full_df[full_df.county == full_df.county.unique()[533]].copy()
-
     # copy original index for later use
     group = group.reset_index(drop=False).rename(columns={'index': 'original_index'})
 
@@ -220,88 +235,45 @@ def check_consecutive_days(group):
 
     return three_days_rain_series, three_days_no_rain_series
 
-start = datetime.now()
-
-# Convert 'date' column to datetime format
+# prepare data to be executed in parallel
 full_df['date'] = pd.to_datetime(full_df['date'])
-
-# Sort the data
 full_df = full_df.sort_values(['country', 'state', 'county', 'date'])
-
-# split the df into separate chunks; the samples of a county need to stay together
 df_chunks = [group for _, group in full_df.groupby(['country', 'state', 'county'])]
 
-# create a list of tasks where each task is a delayed execution of the function on a chunk
-delayed_function_calls = [delayed(check_consecutive_days)(chunk) for chunk in df_chunks]
-
-# execute tasks in parallel
-result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed_function_calls)
+# start parallel execution
+start = datetime.now()
+result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed(check_consecutive_days)(chunk) for chunk in df_chunks)
 
 # update the precipitation column in the original dataframe based on results
-for result_subset in tqdm(result_chunks):
-    three_days_rain_series = result_subset[0]
-    three_days_no_rain_series = result_subset[1]
+for three_days_rain_series, three_days_no_rain_series in result_chunks:
     full_df.loc[three_days_rain_series.index, 'three_days_rain'] = three_days_rain_series.values
     full_df.loc[three_days_no_rain_series.index, 'three_days_no_rain'] = three_days_no_rain_series.values
 
-end = datetime.now()
-time_delta = end - start
-print(f'results II: splitting, computing, and rearranging the samples took {time_delta} ({NUM_PROCESSES} cores)')
+print(f"Time elapsed: {datetime.now() - start} ({NUM_PROCESSES} cores)")
 
 # compute statistics & create results df
 def compute_three_day_statistics(df):
-    # df = full_df[full_df.country == 'Switzerland'].copy()
-    
-    # filter rows for the third day in both scenarios
     no_rain_sentiments = df[df['three_days_no_rain']].sentiment_score
     rainy_sentiments = df[df['three_days_rain']].sentiment_score
-
-    # descriptive groups stats
-    no_rain_mean = no_rain_sentiments.mean()
-    no_rain_std = no_rain_sentiments.std()
-
-    rain_mean = rainy_sentiments.mean()
-    rain_std = rainy_sentiments.std()
-
-    # group sizes
-    no_rain_count = len(no_rain_sentiments)
-    rain_count = len(rainy_sentiments)
-
-    # group differences in percent
+    
+    no_rain_mean, no_rain_std, no_rain_count = no_rain_sentiments.mean(), no_rain_sentiments.std(), len(no_rain_sentiments)
+    rain_mean, rain_std, rain_count = rainy_sentiments.mean(), rainy_sentiments.std(), len(rainy_sentiments)
     group_diff = (no_rain_mean - rain_mean) * 100
-
-    # effect size for comparing the means of two groups
     cohens_d = (no_rain_mean - rain_mean) / np.sqrt((no_rain_std ** 2 + rain_std ** 2) / 2)
-
-    # Welch's t-test; statistical difference test that doesn't assume equal variances
     statistic, p_val = stats.ttest_ind(no_rain_sentiments, rainy_sentiments, equal_var=False)
 
     return no_rain_mean, rain_mean, group_diff, no_rain_std, rain_std, cohens_d, no_rain_count, rain_count, statistic, p_val
 
-
 # create a new dataframe, grouped by country
-three_day_difference = full_df.groupby('country').sentiment_score.mean()
-three_day_difference = three_day_difference.to_frame()
-three_day_difference.columns = ['mean_sentiment_score']
-
-# add statistical metrics
 grouped_results = full_df.groupby('country').apply(compute_three_day_statistics)
-nr_mean, r_mean, group_diff, nr_std, r_std, cohens_d, nr_count, r_count, statistic, p_val = zip(*grouped_results)
+result_cols = ['no_rain_mean', 'three_day_rain_mean', 'group_diff', 'no_rain_std', 'three_day_rain_std', 
+               'effect_size_d', 'no_rain_days', 'three_day_rain_days', 't_welch', 'p_welch']
+results_df = pd.DataFrame(grouped_results.tolist(), columns=result_cols, index=grouped_results.index)
 
-three_day_difference['group_diff'] = group_diff
-three_day_difference['no_rain_mean'] = nr_mean
-three_day_difference['three_day_rain_mean'] = r_mean
-
-three_day_difference['no_rain_std'] = nr_std
-three_day_difference['three_day_rain_std'] = r_std
-
-three_day_difference['no_rain_days'] = nr_count
-three_day_difference['three_day_rain_days'] = r_count
-
-three_day_difference['effect_size_d'] = cohens_d
-three_day_difference['p_welch'] = p_val
-three_day_difference['t_welch'] = statistic
+three_day_difference = full_df.groupby('country').sentiment_score.mean().reset_index(name='mean_sentiment_score')
+three_day_difference = three_day_difference.set_index('country')
+three_day_difference = three_day_difference.join(results_df)
 
 # save results
 three_day_difference.to_csv(f'{RESULTS_ROOT}/{YEAR}_three_day_difference.csv', index=True)
-print(f"saved results II successfully to '{RESULTS_ROOT}/{YEAR}_three_day_difference.csv'")
+print(f"Results saved to '{RESULTS_ROOT}/{YEAR}_three_day_difference.csv'")
