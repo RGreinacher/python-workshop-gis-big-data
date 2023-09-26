@@ -122,7 +122,8 @@ average_group_diff_by_state.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differen
 
 # take end time
 end_execution_timestamp = datetime.now()
+time_diff = end_execution_timestamp - start_execution_timestamp
 
 # print status
 print(f"analysis complete")
-print(f"this script took {end_execution_timestamp - start_execution_timestamp} to execute")
+print(f"this script took {time_diff} to execute")
