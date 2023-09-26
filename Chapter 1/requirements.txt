@@ -9,4 +9,3 @@ wheel
 xarray
 jupytext
 ipykernel
-nb_conda_kernels
