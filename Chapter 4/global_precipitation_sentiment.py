@@ -27,9 +27,6 @@ RESULTS_ROOT = 'PATH/TO/RESULTS'
 YEAR = 2022
 NUM_PROCESSES = 7
 
-DATASET_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/FASRC'
-RESULTS_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/results'
-
 
 
 # # configure CLI arguments
