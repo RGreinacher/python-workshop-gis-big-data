@@ -16,9 +16,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from scipy import stats
-from tqdm import tqdm
 import xarray as xr
-from glob import glob
 from joblib import Parallel, delayed
 # import argparse # optional, for CLI arguments
 
@@ -27,7 +25,10 @@ from joblib import Parallel, delayed
 DATASET_ROOT = 'PATH/TO/DATASET'
 RESULTS_ROOT = 'PATH/TO/RESULTS'
 YEAR = 2022
-NUM_PROCESSES = 4
+NUM_PROCESSES = 7
+
+DATASET_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/FASRC'
+RESULTS_ROOT = '/Users/rs/Harvard/Harvard Projekte/O3 Big Data Workshop/Project/data/results'
 
 
 
@@ -50,27 +51,63 @@ NUM_PROCESSES = 4
 ###############################################################################
 # setup tweets table
 ###############################################################################
-# read and pre process tweets table
-tweets_df = pd.read_csv(f'{DATASET_ROOT}/twitter_sentiment_geo_index/num_posts_and_sentiment_summary_{YEAR}.csv')
-tweets_df.columns = ['date', 'country', 'state', 'county', 'sentiment_score', 'tweets'] # rename columns
-tweets_df['state'] = tweets_df.state.apply(lambda x: x.split('_')[-1]) # filter state names
-tweets_df['county'] = tweets_df.county.apply(lambda x: x.split('_')[-1]) # filter county names
+start_ts = datetime.now()
 
-# define a toy example with one country only
-tweets_subset = tweets_df[tweets_df.country.isin(['United States'])]
+# define a function that estimates the number of rows in a csv file
+def estimate_csv_size(file_path):
+    chunk = 1024 * 1024 * 10   # Process 1 MB at a time.
+    f = np.memmap(file_path)
+    num_newlines = sum(np.sum(f[i:i+chunk] == ord('\n')) for i in range(0, len(f), chunk))
+    del f
+    return num_newlines
 
-# read the county coordinates table
+# define data set path
+tweets_file_path = f'{DATASET_ROOT}/twitter_sentiment_geo_index/num_posts_and_sentiment_summary_{YEAR}.csv'
+
+# estimate the number of rows in the csv file (to distribute the work load across processes)
+expected_rows = estimate_csv_size(tweets_file_path)
+rows_per_process = expected_rows // NUM_PROCESSES
+
+# load the county coordinates table to be used in the parallel execution
 county_coordinates = pd.read_csv(f'{DATASET_ROOT}/county_coordinates/lookup.csv')
 
-# add coordinates
-full_df = tweets_subset.merge(county_coordinates, on=['country', 'state', 'county'], how='left')
-full_df = full_df.dropna(subset=['lat', 'lon'])
+# define a function that processes a subset of the tweets table
+def process_df(process_no):
+    # read only a subset of the entire df
+    df = pd.read_csv(
+        tweets_file_path,
+        sep=',',
+        header=None,
+        skiprows=(rows_per_process * process_no) + 1,
+        nrows=rows_per_process,
+        dtype={0: 'str', 1: 'str', 2: 'str', 3: 'str', 4: 'float64', 5: 'Int64'}
+    )
+
+    df.columns = ['date', 'country', 'state', 'county', 'sentiment_score', 'tweets'] # rename columns
+    df['state'] = df.state.apply(lambda x: x.split('_')[-1]) # filter state names
+    df['county'] = df.county.apply(lambda x: x.split('_')[-1]) # filter county names
+
+    # add coordinates
+    df = df.merge(county_coordinates, on=['country', 'state', 'county'], how='left')
+    
+    return df.dropna(subset=['lat', 'lon'])
+
+# define the tasks to be executed in parallel
+delayed_function_calls = [delayed(process_df)(process_no) for process_no in range(NUM_PROCESSES)]
+
+# execute tasks in parallel
+result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed_function_calls)
+
+# combine results
+full_df = pd.concat(result_chunks)
 
 # remove days with very few tweets
-full_df = full_df[full_df.tweets >= 10].copy()
+full_df = full_df[full_df.tweets >= 10]
+full_df = full_df.reset_index(drop=True)
 
 # print status
-print(f"loaded tweets and county coordinates table successfully ({len(full_df)} samples), avg sentiment score: {full_df.sentiment_score.median()}")
+time_delta = datetime.now() - start_ts
+print(f'loading and processing the twitter DF ({len(full_df)} rows) took {time_delta}sec (using {NUM_PROCESSES} processes)')
 
 
 
@@ -83,44 +120,42 @@ noaa_cpc_dataset = xr.open_dataset(f"{DATASET_ROOT}/precipitation/precip.{YEAR}.
 # print status
 print(f"loaded NOAA CPC precipitation data successfully")
 
-# cache indexes for faster access
-day_memory = {}
-lon_memory = {}
-lat_memory = {}
+# augmentation function for the tweets table (subsets)
+def augment_precipitation_values(df, lon_values, lat_values, precip_values):
+    # cache indexes for faster access
+    day_memory = {}
+    lon_memory = {}
+    lat_memory = {}
 
-def precipitation_for_row(row):
-
-    # compute the array index for the day of the year
-    if row.date in day_memory:
-        day_idx = day_memory[row.date]
-    else:
-        day_idx = datetime.strptime(row.date, "%Y-%m-%d").timetuple().tm_yday - 1
-        day_memory[row.date] = day_idx
-
-    # compute array index for longitude value
-    if row.lon in lon_memory:
-        x = lon_memory[row.lon]
-    else:
-        lon_values = noaa_cpc_dataset.indexes['lon']
-        if row.lon < 0:
-            lon_0_to_360 = row.lon + 360
+    def precipitation_for_row(row): #, lon_values, lat_values, precip_values):
+        # compute the array index for the day of the year
+        if row.date in day_memory:
+            day_idx = day_memory[row.date]
         else:
-            lon_0_to_360 = row.lon
-        x = np.abs(lon_values - lon_0_to_360).argmin()
-        lon_memory[row.lon] = x
+            day_idx = datetime.strptime(row.date, "%Y-%m-%d").timetuple().tm_yday - 1
+            day_memory[row.date] = day_idx
 
-    # compute array index for latitude value
-    if row.lat in lat_memory:
-        y = lat_memory[row.lat]
-    else:
-        lat_values = noaa_cpc_dataset.indexes['lat']
-        y = np.abs(lat_values - row.lat).argmin()
-        lat_memory[row.lat] = y
+        # compute array index for longitude value
+        if row.lon in lon_memory:
+            x = lon_memory[row.lon]
+        else:
+            if row.lon < 0:
+                lon_0_to_360 = row.lon + 360
+            else:
+                lon_0_to_360 = row.lon
+            x = np.abs(lon_values - lon_0_to_360).argmin()
+            lon_memory[row.lon] = x
 
-    # read the precipitation value using the three computed indexes
-    return noaa_cpc_dataset.precip.values[day_idx, y, x]
+        # compute array index for latitude value
+        if row.lat in lat_memory:
+            y = lat_memory[row.lat]
+        else:
+            y = np.abs(lat_values - row.lat).argmin()
+            lat_memory[row.lat] = y
 
-def augment_precipitation_values(df):
+        # read the precipitation value using the three computed indexes
+        return precip_values[day_idx, y, x]
+
     # augment tweets table with the NOAA CPC precipitation data
     return df.apply(lambda row: precipitation_for_row(row), axis=1)
 
@@ -131,14 +166,24 @@ def augment_precipitation_values(df):
 ###############################################################################
 start_ts = datetime.now()
 
+# prepare data to be executed in parallel; these datasets will be provided to each worker
+lon_values = noaa_cpc_dataset.indexes['lon']
+lat_values = noaa_cpc_dataset.indexes['lat']
+precip_values = noaa_cpc_dataset.precip.values
+
+# sort the df by country, state, county
+# since each worker keeps track of the already computed day and lat/lon indixes,
+# we want to try to keep similar addresses on the same worker
+full_df.sort_values(['country', 'state', 'county'], inplace=True)
+
 # split the df into separate chunks
 df_chunks = np.array_split(full_df, NUM_PROCESSES)
 
 # create a list of tasks where each task is a delayed execution of the function on a chunk
-delayed_function_calls = [delayed(augment_precipitation_values)(chunk) for chunk in df_chunks]
+delayed_function_calls = [delayed(augment_precipitation_values)(chunk, lon_values, lat_values, precip_values) for chunk in df_chunks]
 
 # execute tasks in parallel
-result_chunks = Parallel(n_jobs=NUM_PROCESSES)(delayed_function_calls)
+result_chunks = Parallel(n_jobs=NUM_PROCESSES, prefer="processes")(delayed_function_calls)
 
 # update the precipitation column in the original dataframe based on results
 for result_subset in result_chunks:
@@ -148,7 +193,7 @@ for result_subset in result_chunks:
 end_ts = datetime.now()
 time_delta = end_ts - start_ts
 print(f'Augmenting the tweets table with precipitation data took {time_delta} ({NUM_PROCESSES} cores)')
-
+    
 # remove nan values
 full_df = full_df.dropna(subset=['precipitation'])
 
@@ -200,7 +245,8 @@ summary_df.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv', index=T
 print(f"saved results I successfully to '{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv'")
 
 # # compute the average group difference by state & save results
-# average_group_diff_by_state = summary_df.groupby('country').group_diff.mean()
+relevant_results = summary_df[(summary_df.rain_count >= 20) & (summary_df.p_val < 0.05)]
+average_group_diff_by_state = relevant_results.groupby('country').group_diff.mean()
 # average_group_diff_by_state.to_csv(f'{RESULTS_ROOT}/{YEAR}_rain_no_rain_differences.csv', index=True)
 
 
@@ -273,6 +319,9 @@ results_df = pd.DataFrame(grouped_results.tolist(), columns=result_cols, index=g
 three_day_difference = full_df.groupby('country').sentiment_score.mean().reset_index(name='mean_sentiment_score')
 three_day_difference = three_day_difference.set_index('country')
 three_day_difference = three_day_difference.join(results_df)
+
+# remove all incomplete rows
+three_day_difference_clean = three_day_difference.dropna()
 
 # save results
 three_day_difference.to_csv(f'{RESULTS_ROOT}/{YEAR}_three_day_difference.csv', index=True)
